@@ -1,5 +1,5 @@
 """
-Planta Virtual de Molienda y Tamizaje  ·  versión simple
+Planta Virtual de Molienda y Tamizaje  ·  versión simple (con más detalle)
 =========================================================
 Circuito: tolva -> alimentador + imán -> molino de bolas (circuito cerrado)
 -> elevador -> zaranda -> silo de producto.
@@ -43,6 +43,9 @@ DEFAULTS = dict(
     eff0=88,
     area=25.0,
     target_mm=0.50,
+    hopper_level=70,
+    silo_level=50,
+    avail=92,
     price_kwh=0.10,
     price_steel=1.40,
     # material personalizado
@@ -51,7 +54,17 @@ DEFAULTS = dict(
     cust_moist=3.0, cust_n=0.95, cust_color="#c9b38a",
 )
 OP_KEYS = ["running", "feed_tph", "f80_mm", "D", "L", "nc", "J", "aperture_mm", "eff0", "area",
-           "target_mm", "price_kwh", "price_steel"]
+           "target_mm", "hopper_level", "silo_level", "avail", "price_kwh", "price_steel"]
+
+ETA_DRIVE = 0.93        # eficiencia motor + reductor + corona
+DRY_FINE_REF = 1.0      # mm: por debajo de esta abertura el tamizado en seco pierde eficiencia
+
+
+def motor_rated_kw(D, L):
+    """Motor instalado: 115 % de la potencia a J = 35 % y 75 % Nc, redondeado a 50 kW."""
+    kw_design = 45.0 * D**2.5 * L * 0.75 * 0.35 * (1 - 1.03 * 0.35)
+    return max(50.0, math.ceil(1.15 * kw_design / ETA_DRIVE / 50.0) * 50.0)
+
 
 C_FRESH, C_MIX, C_DISCH, C_OVER, C_PROD = "#f5b942", "#ffb36b", "#d9a05b", "#ff7a59", "#3ddc97"
 
@@ -101,6 +114,8 @@ def simulate(p):
     screen_cap = 25.0 * math.sqrt(p["aperture_mm"]) * p["area"] * (p["bulk"] / 1.6)
     # la humedad por encima de 3 % empasta la malla y baja la eficiencia
     eff_base = (p["eff0"] / 100.0) * max(0.5, 1.0 - 0.035 * max(0.0, p["moist"] - 3.0))
+    # tamizado en seco: los cortes finos (< 1 mm) pierden eficiencia (ceguera de malla, electrostática)
+    eff_base *= 0.80 + 0.20 * min(1.0, p["aperture_mm"] / DRY_FINE_REF)
 
     S = 2.0 * F          # alimentación total al molino (fresco + retorno)
     x_r = 2.0 * a
@@ -127,7 +142,13 @@ def simulate(p):
     ai = p["ai"]
     ball_kgph = 0.159 * max(ai - 0.015, 1e-4) ** 0.33 * kw
     liner_kgph = 0.0159 * max(ai - 0.0206, 1e-4) ** 0.26 * kw
-    cost_energy = kw * p["price_kwh"] / F
+    # consumo eléctrico: motor del molino (kW al eje / eficiencia) + equipos auxiliares
+    kw_motor = kw / ETA_DRIVE
+    motor_rated = motor_rated_kw(D, L)
+    elev_kw = 0.14 * S                      # elevador de cangilones (~22 m)
+    aux_kw = 12.0 + 5.0 + 15.0 + elev_kw    # zaranda + alimentador + bandas + elevador
+    plant_kw = kw_motor + aux_kw
+    cost_energy = plant_kw * p["price_kwh"] / F
     cost_steel = (ball_kgph + liner_kgph) * p["price_steel"] / F
     return dict(
         F=F, S=S, R=R, cl=R / F * 100.0, kw=kw, rpm=rpm, E_fresh=kw / F,
@@ -137,6 +158,9 @@ def simulate(p):
         dry_tph=F * (1 - p["moist"] / 100.0),
         ball_kgph=ball_kgph, liner_kgph=liner_kgph,
         cost_energy=cost_energy, cost_steel=cost_steel, cost_total=cost_energy + cost_steel,
+        kw_motor=kw_motor, motor_rated=motor_rated, motor_load=kw_motor / motor_rated,
+        elev_kw=elev_kw, aux_kw=aux_kw, plant_kw=plant_kw, E_plant=plant_kw / F,
+        t_day=F * 24.0 * p["avail"] / 100.0,
     )
 
 
@@ -151,6 +175,21 @@ def alarms(p, r):
         out.append(("warning", f"Carga circulante alta ({r['cl']:.0f} %)."))
     if r["util_mill"] > 1.0:
         out.append(("error", "Molino sobrecargado: el flujo total supera su capacidad de referencia."))
+    if r["motor_load"] > 1.0:
+        out.append(("error", f"Motor del molino sobrecargado ({r['kw_motor']:.0f} kW de {r['motor_rated']:.0f} kW instalados): "
+                             "baja el llenado de bolas o la velocidad."))
+    elif r["motor_load"] > 0.9:
+        out.append(("warning", f"Motor del molino al {r['motor_load'] * 100:.0f} % de su potencia instalada."))
+    if p["hopper_level"] < 15:
+        out.append(("error", "Nivel bajo en la tolva de alimentación: riesgo de parada del molino."))
+    if p["silo_level"] > 95:
+        out.append(("error", "Silo de producto casi lleno: hay que despachar o detener la planta."))
+    if p["nc"] > 82:
+        out.append(("warning", "Velocidad muy alta (> 82 % Nc): riesgo de catarata y desgaste de forros."))
+    elif p["nc"] < 65:
+        out.append(("warning", "Velocidad baja (< 65 % Nc): poca elevación de la carga, molienda poco eficiente."))
+    if p["J"] > 40:
+        out.append(("warning", "Llenado de bolas > 40 %: consumo de acero y energía elevados."))
     if r["load"] > 1.0:
         out.append(("warning", f"Zaranda sobrecargada ({r['load'] * 100:.0f} %): "
                                f"la eficiencia cae a {r['eta'] * 100:.0f} %."))
@@ -291,9 +330,9 @@ def plant_html(p, r, mat):
     mcol = mat["color"]
 
     hop_poly = "60,30 180,30 135,115 105,115"
-    y_fill = 30 + (1 - 0.70) * 85                       # tolva al 70 % (fijo)
+    y_fill = 30 + (1 - p["hopper_level"] / 100.0) * 85
     sil_poly = "650,246 770,246 770,360 720,398 700,398 650,360"
-    y_s = 246 + (1 - 0.50) * 152                        # silo al 50 % (fijo)
+    y_s = 246 + (1 - p["silo_level"] / 100.0) * 152
     t_belt = dur(F, ref, slow=9, fast=0.4)
     t_b3 = dur(S, ref, slow=9, fast=0.4)
     t_b4 = dur(R, ref, slow=9, fast=0.4)
@@ -327,10 +366,14 @@ def plant_html(p, r, mat):
     <text class="name" x="130" y="184" text-anchor="middle">FE-101 · Alimentador de banda</text>
     <text class="sub" x="130" y="196" text-anchor="middle">Imán de banda (retira hierro)</text>
     <!-- molino ML-201 y motor -->
-    <line x1="180" y1="314" x2="242" y2="314" stroke="#8fa3c2" stroke-width="6"/>
+    <line x1="180" y1="314" x2="192" y2="314" stroke="#8fa3c2" stroke-width="6"/>
+    <rect x="192" y="298" width="32" height="32" rx="4" fill="#1f3354" stroke="#8fa3c2" stroke-width="2"/>
+    <text x="208" y="318" text-anchor="middle" class="loop">GB</text>
+    <line x1="224" y1="314" x2="242" y2="314" stroke="#8fa3c2" stroke-width="6"/>
     <rect x="100" y="288" width="80" height="52" rx="6" fill="#16223a" stroke="#8fa3c2" stroke-width="2"/>
     <text x="140" y="320" text-anchor="middle" class="name" style="font-size:17px">M</text>
-    <text class="sub" x="140" y="357" text-anchor="middle">Motor principal</text>
+    <text class="sub" x="140" y="357" text-anchor="middle">Motor principal · reductor</text>
+    <text class="stream" x="140" y="370" text-anchor="middle" fill="{C_FRESH}">{(r['kw_motor'] if run else 0):.0f} / {r['motor_rated']:.0f} kW</text>
     {mill_svg(340, 312, 88, p['J'] / 100.0, r['rpm'], run)}
     <text class="name" x="322" y="440" text-anchor="end">ML-201 · Molino de bolas</text>
     <text class="sub" x="322" y="453" text-anchor="end">{p['D']:.1f} × {p['L']:.1f} m · J = {p['J']} % · {p['nc']} % Nc</text>
@@ -345,6 +388,7 @@ def plant_html(p, r, mat):
     <text class="name" x="893" y="262">EL-301</text>
     <text class="sub" x="893" y="275">Elevador de</text>
     <text class="sub" x="893" y="287">cangilones</text>
+    <text class="sub" x="893" y="299">{(r['elev_kw'] if run else 0):.0f} kW</text>
     <!-- zaranda SC-401 -->
     <rect x="578" y="46" width="268" height="104" rx="6" fill="none" stroke="#3a4d6e" stroke-width="1.5" stroke-dasharray="5 4"/>
     <polygon points="610,138 818,138 738,172 690,172" fill="#101b30" stroke="#8fa3c2" stroke-width="2"/>
@@ -355,6 +399,7 @@ def plant_html(p, r, mat):
       </g>
     </g>
     <text class="name" x="712" y="26" text-anchor="middle">SC-401 · Zaranda vibratoria</text>
+    <text class="sub" x="712" y="38" text-anchor="middle">{p['aperture_mm']:.2f} mm · η = {(r['eta'] * 100 if run else 0):.0f} %</text>
     <!-- silo TK-501 -->
     <clipPath id="clipS"><polygon points="{sil_poly}"/></clipPath>
     <polygon points="{sil_poly}" fill="#101b30" stroke="#8fa3c2" stroke-width="2.5"/>
@@ -482,6 +527,10 @@ def main():
         st.slider("Eficiencia base (%)", 40, 98, key="eff0")
         st.slider("Área de tamizado (m²)", 5.0, 60.0, step=1.0, key="area")
         st.slider("Objetivo P80 del producto (mm)", 0.1, 2.0, step=0.05, key="target_mm")
+        with st.expander("Niveles y operación"):
+            st.slider("Nivel de la tolva TK-101 (%)", 0, 100, key="hopper_level")
+            st.slider("Nivel del silo TK-501 (%)", 0, 100, key="silo_level")
+            st.slider("Disponibilidad de la planta (%)", 50, 100, key="avail")
         with st.expander("Costos"):
             st.number_input("Energía (USD/kWh)", 0.01, 1.0, step=0.01, key="price_kwh")
             st.number_input("Acero de bolas y forros (USD/kg)", 0.1, 10.0, step=0.1, key="price_steel")
@@ -495,8 +544,9 @@ def main():
     cols[1].metric("P80 producto", f"{r['p80_prod']:.0f} µm",
                    delta=f"{r['p80_prod'] - p['target_mm'] * 1000:+.0f} µm vs objetivo", delta_color="inverse")
     cols[2].metric("Carga circulante", f"{r['cl'] if run else 0:.0f} %")
-    cols[3].metric("Potencia molino", f"{r['kw'] if run else 0:.0f} kW")
-    cols[4].metric("Energía específica", f"{r['E_fresh']:.1f} kWh/t")
+    cols[3].metric("Potencia motor molino", f"{r['kw_motor'] if run else 0:.0f} kW",
+                   delta=f"{r['motor_load'] * 100:.0f} % de {r['motor_rated']:.0f} kW", delta_color="off")
+    cols[4].metric("Energía específica (planta)", f"{r['E_plant']:.1f} kWh/t")
     cols[5].metric("Costo operativo", f"{r['cost_total']:.2f} USD/t")
 
     diagram = plant_html(p, r, mat)
@@ -509,7 +559,7 @@ def main():
         getattr(st, kind)(msg)
 
     t1, t2, t3, t4 = st.tabs(["📈 Granulometría", "📋 Balance de masa", "🔬 Sensibilidad",
-                              "🛠️ Desgaste y costos"])
+                              "🛠️ Energía, desgaste y costos"])
     with t1:
         st.plotly_chart(psd_figure(p, r), width="stretch")
         st.caption("Curvas Rosin-Rammler. La línea roja es la abertura de la zaranda: "
@@ -529,13 +579,20 @@ def main():
         st.dataframe(df, width="stretch", hide_index=True)
         st.caption(f"Base seca de la alimentación: {r['dry_tph']:.1f} t/h (humedad {p['moist']:.1f} %). "
                    "Balance en estado estable: producto = alimentación fresca; "
-                   "carga circulante = oversize ÷ alimentación fresca. Modelo didáctico.")
+                   "carga circulante = oversize ÷ alimentación fresca. "
+                   f"Con {p['avail']} % de disponibilidad: {r['t_day']:,.0f} t/día. Modelo didáctico.")
     with t3:
         f1, f2 = sweep_figures(p)
         a, b = st.columns(2)
         a.plotly_chart(f1, width="stretch")
         b.plotly_chart(f2, width="stretch")
     with t4:
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Molino (al eje)", f"{r['kw'] if run else 0:.0f} kW")
+        e2.metric("Motor (con pérdidas)", f"{r['kw_motor'] if run else 0:.0f} kW")
+        e3.metric("Auxiliares", f"{r['aux_kw'] if run else 0:.0f} kW",
+                  help="Zaranda, alimentador, bandas y elevador.")
+        e4.metric("Total planta", f"{r['plant_kw'] if run else 0:.0f} kW")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Consumo de bolas", f"{r['ball_kgph'] if run else 0:.1f} kg/h")
         c2.metric("Desgaste de forros", f"{r['liner_kgph'] if run else 0:.2f} kg/h")
